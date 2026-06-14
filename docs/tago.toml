@@ -1,0 +1,10 @@
+title       = "osmwiki"
+baseURL     = "https://osmwiki-cli.tamnd.com/"
+description = "Search OpenStreetMap wiki"
+contentDir  = "content"
+outputDir   = "public"
+theme       = "tago-doks"
+syntaxHighlight = "true"
+
+[params]
+github = "https://github.com/tamnd/osmwiki-cli"
