@@ -1,52 +1,64 @@
 // Package osmwiki is the library behind the osmwiki command line:
-// the HTTP client, request shaping, and the typed data models for osmwiki.
-//
-// The Client here is the spine every command shares. It sets a real
-// User-Agent, paces requests so a busy session stays polite, and retries the
-// transient failures (429 and 5xx) that any public site throws under load.
-// Build your endpoint calls and JSON decoding on top of it.
+// the HTTP client, request shaping, and the typed data models for the
+// OpenStreetMap wiki fetched via the MediaWiki API.
 package osmwiki
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
+	"regexp"
+	"strings"
+	"sync"
 	"time"
 )
 
-// DefaultUserAgent identifies the client to osmwiki. A real, honest
-// User-Agent is both polite and the thing most likely to keep you unblocked.
-const DefaultUserAgent = "osmwiki/dev (+https://github.com/tamnd/osmwiki-cli)"
+const DefaultUserAgent = "Mozilla/5.0 (compatible; osmwiki-cli/0.1; +https://github.com/tamnd/osmwiki-cli)"
 
-// Client talks to osmwiki over HTTP.
-type Client struct {
-	HTTP      *http.Client
+var htmlTagRe = regexp.MustCompile("<[^>]+>")
+
+// Config holds constructor parameters.
+type Config struct {
+	BaseURL   string
 	UserAgent string
-	// Rate is the minimum gap between requests. Zero means no pacing.
-	Rate    time.Duration
-	Retries int
-
-	last time.Time
+	Rate      time.Duration
+	Retries   int
+	Timeout   time.Duration
 }
 
-// NewClient returns a Client with sensible defaults: a 30s timeout, a 200ms
-// minimum gap between requests, and five retries on transient errors.
-func NewClient() *Client {
-	return &Client{
-		HTTP:      &http.Client{Timeout: 30 * time.Second},
+// DefaultConfig returns sensible defaults.
+func DefaultConfig() Config {
+	return Config{
+		BaseURL:   "https://wiki.openstreetmap.org",
 		UserAgent: DefaultUserAgent,
-		Rate:      200 * time.Millisecond,
-		Retries:   5,
+		Rate:      500 * time.Millisecond,
+		Retries:   3,
+		Timeout:   30 * time.Second,
 	}
 }
 
-// Get fetches url and returns the response body. It paces and retries according
-// to the client's settings. The caller owns nothing extra; the body is read
-// fully and closed here.
-func (c *Client) Get(ctx context.Context, url string) ([]byte, error) {
+// Client talks to the OpenStreetMap wiki MediaWiki API.
+type Client struct {
+	cfg        Config
+	httpClient *http.Client
+	mu         sync.Mutex
+	last       time.Time
+}
+
+// NewClient returns a Client with the given config.
+func NewClient(cfg Config) *Client {
+	return &Client{
+		cfg:        cfg,
+		httpClient: &http.Client{Timeout: cfg.Timeout},
+	}
+}
+
+func (c *Client) get(ctx context.Context, rawURL string) ([]byte, error) {
 	var lastErr error
-	for attempt := 0; attempt <= c.Retries; attempt++ {
+	for attempt := 0; attempt <= c.cfg.Retries; attempt++ {
 		if attempt > 0 {
 			select {
 			case <-ctx.Done():
@@ -54,27 +66,27 @@ func (c *Client) Get(ctx context.Context, url string) ([]byte, error) {
 			case <-time.After(backoff(attempt)):
 			}
 		}
-		body, retry, err := c.do(ctx, url)
+		b, retry, err := c.do(ctx, rawURL)
 		if err == nil {
-			return body, nil
+			return b, nil
 		}
 		lastErr = err
 		if !retry {
 			return nil, err
 		}
 	}
-	return nil, fmt.Errorf("get %s: %w", url, lastErr)
+	return nil, fmt.Errorf("get: %w", lastErr)
 }
 
-func (c *Client) do(ctx context.Context, url string) (body []byte, retry bool, err error) {
+func (c *Client) do(ctx context.Context, rawURL string) ([]byte, bool, error) {
 	c.pace()
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
 	if err != nil {
 		return nil, false, err
 	}
-	req.Header.Set("User-Agent", c.UserAgent)
+	req.Header.Set("User-Agent", c.cfg.UserAgent)
 
-	resp, err := c.HTTP.Do(req)
+	resp, err := c.httpClient.Do(req)
 	if err != nil {
 		return nil, true, err
 	}
@@ -87,19 +99,20 @@ func (c *Client) do(ctx context.Context, url string) (body []byte, retry bool, e
 		return nil, false, fmt.Errorf("http %d", resp.StatusCode)
 	}
 
-	b, err := io.ReadAll(resp.Body)
+	b, err := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
 	if err != nil {
 		return nil, true, err
 	}
 	return b, false, nil
 }
 
-// pace blocks until at least Rate has passed since the previous request.
 func (c *Client) pace() {
-	if c.Rate <= 0 {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.cfg.Rate <= 0 {
 		return
 	}
-	if wait := c.Rate - time.Since(c.last); wait > 0 {
+	if wait := c.cfg.Rate - time.Since(c.last); wait > 0 {
 		time.Sleep(wait)
 	}
 	c.last = time.Now()
@@ -111,4 +124,96 @@ func backoff(attempt int) time.Duration {
 		d = 5 * time.Second
 	}
 	return d
+}
+
+// Search searches OpenStreetMap wiki pages by keyword.
+func (c *Client) Search(ctx context.Context, query string, limit int) ([]Page, error) {
+	if limit <= 0 {
+		limit = 20
+	}
+	apiURL := fmt.Sprintf(
+		"%s/w/api.php?action=query&list=search&srsearch=%s&srlimit=%d&format=json",
+		c.cfg.BaseURL, url.QueryEscape(query), limit,
+	)
+	raw, err := c.get(ctx, apiURL)
+	if err != nil {
+		return nil, err
+	}
+	var resp wireSearchResponse
+	if err := json.Unmarshal(raw, &resp); err != nil {
+		return nil, fmt.Errorf("decode search response: %w", err)
+	}
+	pages := make([]Page, 0, len(resp.Query.Search))
+	for i, w := range resp.Query.Search {
+		pages = append(pages, wireToPage(w, i+1))
+	}
+	return pages, nil
+}
+
+// GetPage fetches a single page extract by title.
+// Returns nil, nil when the page does not exist (pageid == -1).
+func (c *Client) GetPage(ctx context.Context, title string) (*PageDetail, error) {
+	apiURL := fmt.Sprintf(
+		"%s/w/api.php?action=query&prop=extracts&exintro&titles=%s&format=json",
+		c.cfg.BaseURL, url.QueryEscape(title),
+	)
+	raw, err := c.get(ctx, apiURL)
+	if err != nil {
+		return nil, err
+	}
+	var resp wireExtractResponse
+	if err := json.Unmarshal(raw, &resp); err != nil {
+		return nil, fmt.Errorf("decode page response: %w", err)
+	}
+	for _, wp := range resp.Query.Pages {
+		if wp.PageID == -1 {
+			return nil, nil
+		}
+		d := wireToPageDetail(wp)
+		return &d, nil
+	}
+	return nil, nil
+}
+
+func pageURL(title string) string {
+	return fmt.Sprintf("https://wiki.openstreetmap.org/wiki/%s", strings.ReplaceAll(title, " ", "_"))
+}
+
+func stripHTML(s string) string {
+	return htmlTagRe.ReplaceAllString(s, "")
+}
+
+func truncateRunes(s string, n int) string {
+	runes := []rune(s)
+	if len(runes) <= n {
+		return s
+	}
+	return string(runes[:n])
+}
+
+func wireToPage(w wireSearchPage, rank int) Page {
+	snippet := truncateRunes(stripHTML(w.Snippet), 120)
+	updated := ""
+	if len(w.Timestamp) >= 10 {
+		updated = w.Timestamp[:10]
+	}
+	return Page{
+		Rank:      rank,
+		ID:        w.PageID,
+		Title:     w.Title,
+		Snippet:   snippet,
+		WordCount: w.WordCount,
+		Updated:   updated,
+		URL:       pageURL(w.Title),
+	}
+}
+
+func wireToPageDetail(w wireExtractPage) PageDetail {
+	extract := truncateRunes(stripHTML(w.Extract), 500)
+	return PageDetail{
+		ID:      w.PageID,
+		Title:   w.Title,
+		Extract: extract,
+		URL:     pageURL(w.Title),
+	}
 }
